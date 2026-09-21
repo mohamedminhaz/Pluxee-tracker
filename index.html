@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
@@ -946,5 +947,43 @@ window.addEventListener("beforeunload", function(e){
   if(hasDraft){ e.preventDefault(); e.returnValue=""; return ""; }
 });
 </script>
+
+const CLIENT_ID = '935537366766-7f713lqm5ouolbnil4uv60fgmvrto3cm.apps.googleusercontent.com';
+const SCOPES = 'https://www.googleapis.com/auth/drive.appdata';
+
+let tokenClient;
+let accessToken = null;
+
+function initGoogleAuth() {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        callback: (response) => {
+            if (response.error !== undefined) {
+                console.error(response);
+                return;
+            }
+            accessToken = response.access_token;
+            // Proceed with your sync function (e.g., uploadDataToDrive())
+            syncToDrive();
+        },
+    });
+}
+
+// Triggered when you click the manual "Sync" button from your menu
+function handleAuthClick() {
+    if (!tokenClient) {
+        initGoogleAuth();
+    }
+    if (accessToken === null) {
+        // Prompt the user for consent
+        tokenClient.requestAccessToken({ prompt: 'consent' });
+    } else {
+        // Token already exists, proceed directly
+        tokenClient.requestAccessToken({ prompt: '' });
+    }
+}
+
+  
 </body>
 </html>
