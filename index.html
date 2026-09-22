@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
@@ -10,6 +9,7 @@
 <meta name="mobile-web-app-capable" content="yes"/>
 <title>Pluxee Tracker</title>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
+<script src="https://accounts.google.com/gsi/client" defer onload="onGisLoad()"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{--dark:#111827;--bg:#f2f2ee;--card:#fff;--rad:15px;--shadow:0 1px 4px rgba(0,0,0,.04)}
@@ -226,6 +226,7 @@ let state = {
   importStatus: null,
   rolloverPopover: null, // catId | null
   datePicker: null, // {value, viewMonth, onSelect}
+  syncStatus: null, // {state:'syncing'|'success'|'error', msg}
 };
 
 function newRow(){ return {_id:Math.random().toString(36).slice(2), cat:null, amount:"", note:"", date:todayStr()}; }
@@ -308,6 +309,7 @@ function persistMonth(m, txns){
   const newData = {...state.allData, [m]:{transactions:txns}};
   saveMonth(m, {transactions:txns});
   state.allData = newData;
+  scheduleAutoSync();
 }
 
 // ── Actions ────────────────────────────────────────────────────────────────────
@@ -317,7 +319,7 @@ function submitAdd(){
   const now = new Date().toISOString();
   valid.forEach(r=>{
     const m = r.date.slice(0,7);
-    const tx = {id:Date.now()+Math.random(), category:r.cat, amount:Number(r.amount), note:r.note.trim(), date:new Date(r.date+"T12:00:00").toISOString(), createdAt:now};
+    const tx = {id:Date.now()+Math.random(), category:r.cat, amount:Number(r.amount), note:r.note.trim(), date:new Date(r.date+"T12:00:00").toISOString(), createdAt:now, updatedAt:now};
     persistMonth(m, [...getTxns(m), tx]);
   });
   setState({mode:null,addRows:[newRow()]});
@@ -327,7 +329,8 @@ function submitEdit(){
   const f=state.editForm;
   if(!f.cat||!f.amount||!isValidDateStr(f.date)) return;
   const newMonth = f.date.slice(0,7);
-  const tx={id:state.editTx.id,category:f.cat,amount:Number(f.amount),note:f.note.trim(),date:new Date(f.date+"T12:00:00").toISOString(),createdAt:state.editTx.createdAt||new Date().toISOString()};
+  const now=new Date().toISOString();
+  const tx={id:state.editTx.id,category:f.cat,amount:Number(f.amount),note:f.note.trim(),date:new Date(f.date+"T12:00:00").toISOString(),createdAt:state.editTx.createdAt||now,updatedAt:now};
   const remaining = getTxns(state.month).filter(t=>t.id!==state.editTx.id);
   persistMonth(state.month, remaining);
   persistMonth(newMonth, [...getTxns(newMonth), tx]);
@@ -336,6 +339,7 @@ function submitEdit(){
 
 function submitBulk(){
   const now = state.month;
+  const nowIso=new Date().toISOString();
   const current = getTxns(now);
   const affectedIds = state.bulkRows.map(r=>r.id);
   const remaining = current.filter(t=>!affectedIds.includes(t.id));
@@ -344,7 +348,7 @@ function submitBulk(){
   state.bulkRows.forEach(r=>{
     const orig = current.find(t=>t.id===r.id);
     if(!orig) return;
-    const tx = {id:orig.id, category:r.cat||orig.category, amount:Number(r.amount)||orig.amount, note:r.note??orig.note, date:isValidDateStr(r.date)?new Date(r.date+"T12:00:00").toISOString():orig.date, createdAt:orig.createdAt||new Date().toISOString()};
+    const tx = {id:orig.id, category:r.cat||orig.category, amount:Number(r.amount)||orig.amount, note:r.note??orig.note, date:isValidDateStr(r.date)?new Date(r.date+"T12:00:00").toISOString():orig.date, createdAt:orig.createdAt||nowIso, updatedAt:nowIso};
     const m = tx.date.slice(0,7);
     movedByMonth[m]=movedByMonth[m]||[];
     movedByMonth[m].push(tx);
@@ -364,7 +368,162 @@ function confirmDeleteNow(){
   const cd = state.confirmDelete;
   if(!cd) return;
   persistMonth(cd.month, getTxns(cd.month).filter(t=>t.id!==cd.id));
+  markDeleted(cd.id);
   setState({confirmDelete:null, mode: cd.fromEdit ? null : state.mode});
+}
+
+// ── Google Drive Sync ────────────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID = "935537366766-7f713lqm5ouolbnil4uv60fgmvrto3cm.apps.googleusercontent.com";
+const DRIVE_FILE_NAME = "pluxee-backup.json";
+let tokenClient = null, accessToken = null, tokenExpiry = 0, autoSyncTimer = null;
+
+function onGisLoad(){
+  if(!(window.google && google.accounts && google.accounts.oauth2)) return;
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: "https://www.googleapis.com/auth/drive.appdata",
+    callback: ()=>{}
+  });
+  render(); // sync button can now become active
+  if(localStorage.getItem("pluxee_drive_connected")==="1"){
+    driveSync(false).catch(()=>{});
+  }
+}
+
+function ensureToken(interactive){
+  return new Promise((resolve,reject)=>{
+    if(accessToken && Date.now() < tokenExpiry-30000){ resolve(accessToken); return; }
+    if(!tokenClient){ reject(new Error("Google sign-in is still loading — try again in a moment.")); return; }
+    let settled=false;
+    const timeout=setTimeout(()=>{ if(!settled){ settled=true; reject(new Error(interactive?"Sign-in was closed or timed out.":"Not connected yet — tap Connect to sign in.")); } }, interactive?60000:4000);
+    tokenClient.callback=(resp)=>{
+      if(settled) return; settled=true; clearTimeout(timeout);
+      if(resp.error){ reject(new Error("Google sign-in error: "+resp.error)); return; }
+      accessToken=resp.access_token; tokenExpiry=Date.now()+(resp.expires_in*1000);
+      localStorage.setItem("pluxee_drive_connected","1");
+      resolve(accessToken);
+    };
+    tokenClient.requestAccessToken({prompt: interactive?"consent":""});
+  });
+}
+
+function getDeletedMap(){ try{ return JSON.parse(localStorage.getItem("pluxee_deleted")||"{}"); }catch(e){ return {}; } }
+function markDeleted(id){
+  const m=getDeletedMap();
+  m[id]=new Date().toISOString();
+  localStorage.setItem("pluxee_deleted", JSON.stringify(m));
+}
+
+function mergeData(local, remote, deletedLocal, deletedRemote){
+  const deleted={...deletedRemote};
+  Object.entries(deletedLocal||{}).forEach(([id,ts])=>{
+    if(!deleted[id] || new Date(ts)>new Date(deleted[id])) deleted[id]=ts;
+  });
+  const months=new Set([...Object.keys(local||{}), ...Object.keys(remote||{})]);
+  const merged={};
+  months.forEach(m=>{
+    const a=(local[m]&&local[m].transactions)||[];
+    const b=(remote[m]&&remote[m].transactions)||[];
+    const byId=new Map();
+    [...a,...b].forEach(t=>{
+      const existing=byId.get(t.id);
+      if(!existing) byId.set(t.id,t);
+      else{
+        const at=new Date(existing.updatedAt||existing.createdAt||0).getTime();
+        const bt=new Date(t.updatedAt||t.createdAt||0).getTime();
+        if(bt>=at) byId.set(t.id,t);
+      }
+    });
+    const txs=Array.from(byId.values()).filter(t=>{
+      const delAt=deleted[t.id];
+      if(!delAt) return true;
+      const tUpdated=new Date(t.updatedAt||t.createdAt||0).getTime();
+      return tUpdated>new Date(delAt).getTime();
+    });
+    merged[m]={transactions:txs};
+  });
+  return {allData:merged, deleted};
+}
+
+async function apiFetch(url, opts={}){
+  const res=await fetch(url, {...opts, headers:{...(opts.headers||{}), Authorization:"Bearer "+accessToken}});
+  if(!res.ok){
+    const text=await res.text().catch(()=>"");
+    throw new Error("Drive error "+res.status+": "+text.slice(0,180));
+  }
+  return res;
+}
+async function findBackupFileId(){
+  const q=encodeURIComponent(`name='${DRIVE_FILE_NAME}'`);
+  const res=await apiFetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,name,modifiedTime)`);
+  const data=await res.json();
+  return (data.files && data.files[0]) ? data.files[0].id : null;
+}
+async function createBackupFile(contentStr){
+  const metadata={name:DRIVE_FILE_NAME, parents:["appDataFolder"]};
+  const boundary="pluxee_"+Date.now();
+  const body=`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`+
+             `--${boundary}\r\nContent-Type: application/json\r\n\r\n${contentStr}\r\n`+
+             `--${boundary}--`;
+  const res=await apiFetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+    method:"POST", headers:{"Content-Type":`multipart/related; boundary=${boundary}`}, body
+  });
+  const data=await res.json();
+  return data.id;
+}
+async function downloadBackupFile(fileId){
+  const res=await apiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+  const text=await res.text();
+  try{ return JSON.parse(text); }catch(e){ return null; }
+}
+async function uploadBackupFile(fileId, contentObj){
+  await apiFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+    method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify(contentObj)
+  });
+}
+
+function scheduleAutoSync(){
+  if(localStorage.getItem("pluxee_drive_connected")!=="1") return;
+  clearTimeout(autoSyncTimer);
+  autoSyncTimer=setTimeout(()=>{ driveSync(false).catch(()=>{}); }, 4000);
+}
+
+async function driveSync(interactive){
+  setState({syncStatus:{state:"syncing"}});
+  try{
+    await ensureToken(interactive);
+    let fileId=await findBackupFileId();
+    let remotePayload=null;
+    if(fileId) remotePayload=await downloadBackupFile(fileId);
+    const localDeleted=getDeletedMap();
+    const remoteAllData=(remotePayload && remotePayload.allData)||{};
+    const remoteDeleted=(remotePayload && remotePayload.deleted)||{};
+    const {allData:mergedData, deleted:mergedDeleted}=mergeData(state.allData, remoteAllData, localDeleted, remoteDeleted);
+    Object.entries(mergedData).forEach(([m,d])=>{ ensureMonth(m); saveMonth(m,d); });
+    state.allData=mergedData;
+    localStorage.setItem("pluxee_deleted", JSON.stringify(mergedDeleted));
+    MONTHS=getMonths();
+    const payload={allData:mergedData, deleted:mergedDeleted, syncedAt:new Date().toISOString()};
+    if(!fileId) fileId=await createBackupFile(JSON.stringify(payload));
+    else await uploadBackupFile(fileId, payload);
+    localStorage.setItem("pluxee_last_sync", new Date().toISOString());
+    setState({syncStatus:{state:"success"}});
+    setTimeout(()=>{ setState(s=> (s.syncStatus && s.syncStatus.state==="success") ? {syncStatus:null} : {}); }, 4000);
+  }catch(err){
+    setState({syncStatus:{state:"error", msg:(err&&err.message)||"Sync failed"}});
+  }
+}
+
+function timeAgo(iso){
+  if(!iso) return null;
+  const diff=Date.now()-new Date(iso).getTime();
+  const min=Math.round(diff/60000);
+  if(min<1) return "just now";
+  if(min<60) return min+"m ago";
+  const hr=Math.round(min/60);
+  if(hr<24) return hr+"h ago";
+  const day=Math.round(hr/24);
+  return day+"d ago";
 }
 
 // ── Export / Import ──────────────────────────────────────────────────────────
@@ -511,6 +670,22 @@ function doRender(){
   menuBtn.onclick=()=>setState({showMenu:!state.showMenu});
   hright.append(hbadge,menuBtn);
   htop.append(htitle,hright); header.append(htop);
+
+  const driveConnected = localStorage.getItem("pluxee_drive_connected")==="1";
+  const lastSyncIso = localStorage.getItem("pluxee_last_sync");
+  if(driveConnected || state.syncStatus){
+    const sPill=el("button"); sPill.type="button";
+    sPill.style.cssText="margin-top:10px;background:none;border:none;padding:0;display:flex;align-items:center;gap:5px;font-size:11px;color:rgba(255,255,255,.55);cursor:pointer";
+    let dot="#8a97b3", label="Not synced yet — tap to connect";
+    if(state.syncStatus && state.syncStatus.state==="syncing"){ dot="#ffca28"; label="Syncing…"; }
+    else if(state.syncStatus && state.syncStatus.state==="error"){ dot="#ff5252"; label="Sync failed — tap to retry"; }
+    else if(state.syncStatus && state.syncStatus.state==="success"){ dot="#69f0ae"; label="Synced ✓ just now"; }
+    else if(driveConnected && lastSyncIso){ dot="#69f0ae"; label="Synced "+timeAgo(lastSyncIso); }
+    sPill.innerHTML=`<span style="width:6px;height:6px;border-radius:50%;background:${dot};flex-shrink:0"></span><span>${label}</span>`;
+    sPill.onclick=()=>driveSync(true);
+    header.append(sPill);
+  }
+
   const stats=el("div","stats");
   [["Remaining",fmt(totalRemaining),"#69f0ae",""],["Spent",fmt(totalSp),"#ff7961",""]].forEach(([l,v,c,cls])=>{
     const s=el("div","stat"+cls); s.innerHTML=`<div class="stat-l">${l}</div><div class="stat-v mono" style="color:${c}">${v}</div>`; stats.append(s);
@@ -815,6 +990,32 @@ function doRender(){
   const mClose=el("button","close-btn"); mClose.textContent="✕"; mClose.onclick=()=>setState({showMenu:false,importStatus:null}); mHead.querySelector(".panel-head-row").append(mClose); menuPanel.append(mHead);
   const mBody=el("div","panel-body");
 
+  const lblD=el("div","menu-label"); lblD.textContent="Google Drive Sync"; mBody.append(lblD);
+  const driveConn = localStorage.getItem("pluxee_drive_connected")==="1";
+  const lastSync = localStorage.getItem("pluxee_last_sync");
+  const dInfo=el("div"); dInfo.style.cssText="font-size:11px;color:#999;margin-bottom:10px";
+  dInfo.textContent = lastSync ? ("Last synced "+timeAgo(lastSync)) : "Never synced yet — backs up to a hidden Drive folder tied to your Google account, not visible in your normal Drive.";
+  mBody.append(dInfo);
+  const dBtn=el("button","menu-item");
+  dBtn.style.background = driveConn ? "#eef6ee" : "#fafaf8";
+  dBtn.style.borderColor = driveConn ? "#cfe8cf" : "#ebebeb";
+  dBtn.textContent = driveConn ? "🔄 Sync Now" : "🔗 Connect Google Drive & Sync";
+  dBtn.onclick=()=>driveSync(true);
+  mBody.append(dBtn);
+  if(state.syncStatus){
+    const dStatus=el("div");
+    const c = state.syncStatus.state==="error" ? "#d32f2f" : state.syncStatus.state==="success" ? "#2e7d32" : "#888";
+    dStatus.style.cssText="font-size:11px;margin-top:6px;color:"+c;
+    dStatus.textContent = state.syncStatus.state==="syncing" ? "Syncing with Drive…" : state.syncStatus.state==="success" ? "Synced successfully ✓" : (state.syncStatus.msg||"Sync failed");
+    mBody.append(dStatus);
+  }
+  if(driveConn){
+    const disconnectBtn=el("button"); disconnectBtn.textContent="Disconnect this device";
+    disconnectBtn.style.cssText="background:none;border:none;color:#c05c10;font-size:11px;font-weight:700;text-decoration:underline;padding:6px 0 0;display:block";
+    disconnectBtn.onclick=()=>{ localStorage.removeItem("pluxee_drive_connected"); accessToken=null; tokenExpiry=0; setState({}); };
+    mBody.append(disconnectBtn);
+  }
+
   const lbl1=el("div","menu-label"); lbl1.textContent="Export"; mBody.append(lbl1);
   const csvBtn=el("button","menu-item"); csvBtn.textContent="⬇ Export as CSV (open in Sheets/Excel)"; csvBtn.onclick=exportCSV; mBody.append(csvBtn);
   const jsonBtn=el("button","menu-item"); jsonBtn.textContent="⬇ Export as JSON (full backup / seed data)"; jsonBtn.onclick=exportJSON; mBody.append(jsonBtn);
@@ -947,43 +1148,5 @@ window.addEventListener("beforeunload", function(e){
   if(hasDraft){ e.preventDefault(); e.returnValue=""; return ""; }
 });
 </script>
-
-const CLIENT_ID = '935537366766-7f713lqm5ouolbnil4uv60fgmvrto3cm.apps.googleusercontent.com';
-const SCOPES = 'https://www.googleapis.com/auth/drive.appdata';
-
-let tokenClient;
-let accessToken = null;
-
-function initGoogleAuth() {
-    tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: CLIENT_ID,
-        scope: SCOPES,
-        callback: (response) => {
-            if (response.error !== undefined) {
-                console.error(response);
-                return;
-            }
-            accessToken = response.access_token;
-            // Proceed with your sync function (e.g., uploadDataToDrive())
-            syncToDrive();
-        },
-    });
-}
-
-// Triggered when you click the manual "Sync" button from your menu
-function handleAuthClick() {
-    if (!tokenClient) {
-        initGoogleAuth();
-    }
-    if (accessToken === null) {
-        // Prompt the user for consent
-        tokenClient.requestAccessToken({ prompt: 'consent' });
-    } else {
-        // Token already exists, proceed directly
-        tokenClient.requestAccessToken({ prompt: '' });
-    }
-}
-
-  
 </body>
 </html>
